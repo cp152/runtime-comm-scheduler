@@ -61,13 +61,44 @@ layer_id, bucket_id, ordinal
 
 禁止使用 object identity、pointer、随机 ID、tensor address 或本地 timestamp。
 
-### 4.2 基础执行计划
+字段含义：
+
+| 字段 | 含义 |
+|---|---|
+| `iteration` | 训练 iteration 编号。 |
+| `microbatch` | 当前 microbatch 编号。 |
+| `parallelism` | DP/TP/PP 等训练语义类别。 |
+| `process_group_id` | 稳定的逻辑 process group 标识，决定顺序一致性的边界。 |
+| `layer_id` | collective 对应的逻辑 layer。 |
+| `bucket_id` | layer 内 gradient/parameter bucket 编号。 |
+| `ordinal` | 处理其他字段相同的重复 collective 的稳定序号。 |
+
+`TaskKey` 负责回答“这是哪个逻辑 collective”，用于 plan 顺序、跨 rank 校验和 telemetry 对齐。
+
+### 4.2 `CommIntent` 运行时绑定
+
+`CommIntent` 负责回答“本 rank 如何执行这个 collective”，字段包括：
+
+| 字段 | 含义 |
+|---|---|
+| `key` | 对应的 `TaskKey`。 |
+| `op` | `all_reduce`、`reduce_scatter` 等 collective 类型。 |
+| `tensor` | 本 rank 的实际通信 tensor。 |
+| `process_group` | 本 rank 的实际 PyTorch ProcessGroup handle。 |
+| `num_bytes` | 通信数据量，用于准入和 telemetry。 |
+| `launch_fn` | admission 后调用原始 collective 的函数。 |
+| `producer` / `consumer` | 可选的训练 DAG 生产者和消费者描述。 |
+| `ready_event` | 可选的 CUDA ready event，表示 tensor 已可通信。 |
+
+`TaskKey` 必须跨 rank 一致；`CommIntent` 可以包含 tensor、event 和 launcher 等 rank-local 对象，因此不能直接在 rank 间共享。
+
+### 4.3 基础执行计划
 
 plan 只作为概念上的共享状态，不在当前代码骨架中固定独立的 plan class 或序列化接口。它至少需要包含版本、窗口、`CommIntent` 元数据对应的有序 key 序列以及 hash。第一阶段所有 rank 使用相同的静态 plan；plan 构建和 rank-0 分发在静态机制通过后再加入。
 
 本地 scheduler 只有在 intent 的 key 和不变量元数据与当前计划相符时，才允许它进入 admission。
 
-### 4.3 Dynamic Admission
+### 4.4 Dynamic Admission
 
 Admission 是独立于基础 plan 的运行时机制。intent ready 后可以暂存在 pending 表中，只有满足 plan 和本地运行条件才被提交。
 
@@ -80,7 +111,7 @@ Admission 是独立于基础 plan 的运行时机制。intent ready 后可以暂
 
 后续可以替换 admission criterion，但不能破坏 per-process-group sequence invariant。
 
-### 4.4 Work 与 stream 语义
+### 4.5 Work 与 stream 语义
 
 `ScheduledWork` 表示底层 PyTorch `Work` 创建前后的统一等待边界，至少支持 `wait()` 和 `is_completed()`。
 
@@ -91,7 +122,7 @@ producer stream -> ready event -> communication stream
 communication completion -> completion event -> consumer stream
 ```
 
-### 4.5 Telemetry
+### 4.6 Telemetry
 
 每个 collective 记录：
 

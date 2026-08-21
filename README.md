@@ -97,6 +97,9 @@ CommIntent
 
 ## 当前状态
 
-当前仓库只包含文档和接口骨架，尚未实现 scheduler 行为、PyTorch 修改、Megatron 接入、NCCL 修改或网络控制。
-
-下一次开发从 [docs/phase1-plan.md](docs/phase1-plan.md) 的 M0 开始。
+- **M0（Gloo 行为 harness）已完成**：两 rank 场景覆盖 FIFO、固定重排、延迟
+  ready 与 divergence 挂起，记录见 [docs/experiments/m0-m4.md](docs/experiments/m0-m4.md)。
+- **M1（核心 schema 与 plan 校验）已完成**：确定性 `TaskKey`、`CommIntent`
+  生命周期、`Plan` 表示与五类校验。
+- **待开发**：M2 起的 scheduler admission、NCCL/CUDA event、Megatron DP
+  adapter 与 plan 版本切换，详见 [docs/phase1-plan.md](docs/phase1-plan.md)。
