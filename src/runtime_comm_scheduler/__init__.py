@@ -2,9 +2,11 @@
 
 from .intent import CommIntent, IntentState, TaskKey
 from .plan import Plan, plan_from_intents
+from .scheduler import AdmissionScheduler
 from .work import ScheduledWork
 
 __all__ = [
+    "AdmissionScheduler",
     "CommIntent",
     "IntentState",
     "Plan",

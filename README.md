@@ -101,5 +101,8 @@ CommIntent
   ready 与 divergence 挂起，记录见 [docs/experiments/m0-m4.md](docs/experiments/m0-m4.md)。
 - **M1（核心 schema 与 plan 校验）已完成**：确定性 `TaskKey`、`CommIntent`
   生命周期、`Plan` 表示与五类校验。
-- **待开发**：M2 起的 scheduler admission、NCCL/CUDA event、Megatron DP
-  adapter 与 plan 版本切换，详见 [docs/phase1-plan.md](docs/phase1-plan.md)。
+- **M2（V0 同步 admission）已完成**：`AdmissionScheduler` 的 submit → 校验 →
+  准入 → 发射路径，两 rank Gloo harness 重现 FIFO 与固定重排且 sequence log
+  一致，乱序提交被强制为计划顺序，错误场景 fail-stop 有界退出。
+- **待开发**：NCCL/CUDA event、异步 admission worker、Megatron DP adapter 与
+  plan 版本切换，详见 [docs/phase1-plan.md](docs/phase1-plan.md)。
