@@ -21,11 +21,12 @@ PlanEntry = tuple[TaskKey, str, int]
 
 @dataclass(frozen=True)
 class Plan:
-    """带版本、带窗口、有序的共享执行计划。
+    """带版本、带窗口的共享规范文档，不是每 rank 的执行计划。
 
-    ``entries`` 是有序的；同一 process group 的诱导子序列由
-    :meth:`group_sequence` 从该全局顺序中按 ``process_group_id`` 过滤得到，
-    因此天然保持 plan 内定义的相对顺序。
+    ``entries`` 是有序的共享载体；同一 process group 的诱导子序列由
+    :meth:`group_sequence` 按 ``process_group_id`` 过滤得到，是唯一跨 rank
+    一致的顺序不变量。每 rank 的实际执行序列是运行时投影，不存入 plan。
+    :meth:`digest` 的语义是文档身份，不是执行顺序。
     """
 
     version: int

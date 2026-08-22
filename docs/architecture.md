@@ -120,13 +120,14 @@ Plan {
   version,
   window_id,
   CommIntent 元数据集合,
-  每 rank 的有序 TaskKey 序列,
-  每个 process group 的诱导子序列,
-  plan_hash
+  每个 process group 的诱导子序列,   // 顺序不变量
+  plan_hash                          // 文档身份，非执行顺序
 }
 ```
 
-代码中不要求单独的 Plan、PlannedIntent 或 LaunchPlan 运行时对象。Plan概念通常以配置文件中指定的通信Task序列，或者是应用层根据training任务流程提交的CommIntent序列来实例化；当前骨架只保留 `CommIntent` 和 scheduler 边界。初期使用每 iteration 的静态有序 key 序列，后续再根据 iteration `k` 的 telemetry 生成 `k+1` 的序列。
+Plan 是一份**全 rank 共享的规范文档**（同一 version/window/hash），不是每 rank 各自的执行计划。`entries` 是确定性的共享载体；per-group 诱导子序列由它过滤得到，是唯一需要跨 rank 一致的顺序不变量。**每 rank 的实际执行序列是运行时投影**（把该 rank 所属各 group 的子序列按训练 DAG 依赖合并），不存入 plan，由 framework adapter 提交、scheduler 按 per-group 子序列校验。`plan_hash` 的语义是「所有 rank 安装同一份文档」，不等于执行顺序相等。
+
+Plan 由配置文件指定的通信 Task 序列或应用层提交的 CommIntent 序列实例化；当前骨架只保留 `CommIntent` 和 scheduler 边界。初期使用每 iteration 的静态有序 key 序列，后续再由 iteration `k` 的 telemetry 生成 `k+1` 的序列。
 
 ### 5.3 Dynamic Admission
 
@@ -151,12 +152,14 @@ Admission 路径根据 plan 未固定的运行时状态做出有限调整：
 
 需要检查：
 
-- plan 安装时的 plan hash 一致性；
+- plan 安装时的文档身份（plan hash）一致性——确保各 rank 安装同一份共享文档；
 - `TaskKey` 的确定性构造；
 - intent 重复和缺失；
-- 提交前的 per-group sequence 校验；
+- 提交前的 per-group sequence 校验——执行期的顺序不变量，由 scheduler 完成；
 - 有界 timeout 和错误处理；
 - FIFO fallback 或显式 fail-stop 模式。
+
+`plan_hash` 一致性与 per-group sequence 校验是两类不同的问题：前者回答「各 rank 是否安装同一份共享文档」，后者回答「每个 group 的执行顺序是否在其成员间一致」。
 
 任务生命周期为：
 
