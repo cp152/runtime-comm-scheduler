@@ -104,5 +104,10 @@ CommIntent
 - **M2（V0 同步 admission）已完成**：`AdmissionScheduler` 的 submit → 校验 →
   准入 → 发射路径，两 rank Gloo harness 重现 FIFO 与固定重排且 sequence log
   一致，乱序提交被强制为计划顺序，错误场景 fail-stop 有界退出。
-- **待开发**：NCCL/CUDA event、异步 admission worker、Megatron DP adapter 与
-  plan 版本切换，详见 [docs/phase1-plan.md](docs/phase1-plan.md)。
+- **M3（NCCL/CUDA event 语义）已完成**：在两台 RTX 3090 上验证 CUDA ready
+  event 的 stream-dependency 机制与 `wait()` 完成语义。发现并补偿了两个
+  关键点：naive 当前 stream event 不追踪 NCCL（comm stream）完成；本环境下裸
+  `Work.wait()` 不保证 GPU 完成（由 `ScheduledWork.wait()` 内补一次设备同步
+  保证）。两 rank NCCL harness 六场景全部通过。
+- **待开发**：异步 admission worker、Megatron DP adapter 与 plan 版本切换，
+  详见 [docs/phase1-plan.md](docs/phase1-plan.md)。

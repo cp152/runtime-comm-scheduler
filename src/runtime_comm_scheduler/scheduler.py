@@ -112,7 +112,9 @@ class AdmissionScheduler:
             return True
         if isinstance(ev, threading.Event):
             return ev.is_set()
-        return True  # CUDA event 的 ready 语义在 M3 实现
+        # CUDA event：ready 由 GPU 侧 stream 顺序保证（_sync_ready_event），
+        # 不需要 CPU 侧阻塞，因此这里直接放行。
+        return True
 
     def _drain(self, g: str) -> None:
         """尽可能把队首且已 ready 的 pending intent 发射出去。"""
@@ -141,10 +143,27 @@ class AdmissionScheduler:
             raise ValidationError(
                 f"intent {intent.key.as_list()} has no launch_fn"
             )
+        self._sync_ready_event(intent)
         underlying = intent.launch_fn()
         work.bind(underlying)
         self._inflight[g].append((work, timing))
         self._launched[g].append(intent.key)
+
+    def _sync_ready_event(self, intent: CommIntent) -> None:
+        """发射前让当前 stream 等待 producer 的 CUDA ready event（M3）。
+
+        把 collective 排在 producer 的 GPU 工作之后（stream-ordered），
+        而不是靠 CPU 阻塞；这样 stream dependency 由 GPU 侧 event 保证，
+        在 profiler/Nsight 上可见为 wait_event -> collective 的依赖边。
+        ``threading.Event`` 的 CPU ready 已在 ``_is_ready`` 处理，这里跳过。
+        """
+        ev = intent.ready_event
+        if ev is None or isinstance(ev, threading.Event):
+            return
+        if hasattr(ev, "record") and hasattr(ev, "query"):  # torch.cuda.Event
+            import torch  # 惰性导入，避免包在无 torch 环境下 import 失败
+
+            torch.cuda.current_stream().wait_event(ev)
 
     def _on_work_complete(self, g: str, timing: CommTiming) -> None:
         """底层 Work 完成时由 ``ScheduledWork`` 回调：释放在途槽位并继续 drain。"""
