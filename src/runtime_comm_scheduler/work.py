@@ -108,9 +108,15 @@ class ScheduledWork:
                 return False
             return bool(self._underlying.is_completed())
 
-    def get_future(self):
-        """M4 引入 future/异步完成通知之前不可用。"""
-        raise NotImplementedError("ScheduledWork future is deferred to M4")
+    def get_future(self) -> "ScheduledFuture":
+        """返回完成 future（M4）：``result()`` 内部走 ``wait()`` 以兑现
+        GPU 完成保证，任意线程调用均安全；``done()`` 透传 ``is_completed``。
+
+        完成检测需要设备同步（M3 发现：裸 Work.wait() 不可靠），因此 future
+        不能靠 worker 侧轮询异步解析，只能在 ``wait()``/``result()`` 调用点
+        推进——它是 ``wait()`` 的便利接口，不是零开销的异步回调。
+        """
+        return ScheduledFuture(self)
 
     def _mark_completed(self) -> None:
         with self._lock:
@@ -128,3 +134,25 @@ class ScheduledWork:
         self._intent.transition(IntentState.COMPLETED)
         if self._on_complete is not None:
             self._on_complete()
+
+
+class ScheduledFuture:
+    """``ScheduledWork.get_future()`` 的完成 future（M4）。
+
+    与 ``ScheduledWork.wait()`` 共享完成语义：``result()`` 内部走
+    ``wait()``（含 M3 的设备同步补偿），因此从任意线程调用都兑现
+    「不提前返回」的契约；``done()`` 透传 ``is_completed()``。
+    """
+
+    def __init__(self, work: ScheduledWork) -> None:
+        self._work = work
+
+    def result(self, timeout: Optional[float] = None) -> bool:
+        """等待完成并返回是否成功（``False`` 表示超时未完成）。"""
+        return self._work.wait(timeout=timeout)
+
+    def done(self) -> bool:
+        return self._work.is_completed()
+
+    def cancelled(self) -> bool:
+        return False

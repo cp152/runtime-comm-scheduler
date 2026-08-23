@@ -109,5 +109,13 @@ CommIntent
   关键点：naive 当前 stream event 不追踪 NCCL（comm stream）完成；本环境下裸
   `Work.wait()` 不保证 GPU 完成（由 `ScheduledWork.wait()` 内补一次设备同步
   保证）。两 rank NCCL harness 六场景全部通过。
-- **待开发**：异步 admission worker、Megatron DP adapter 与 plan 版本切换，
+- **M4（异步 admission worker）已完成**：deferred launch 移到专门 worker
+  线程 + 显式 communication stream。producer 的 `submit` 只校验 + park +
+  唤醒、立即返回；worker 线程按 plan 顺序 drain 发射，`out_of_order_submit`
+  经 worker 仍强制计划顺序，`delayed_ready` 的 stream dependency 经 comm
+  stream 正确，16 intent 场景 producer 继续执行与 collective 重叠。关口实验
+  同时记录了硬限制：同一 communicator 多线程并发提交不安全（会打挂进程）。
+  `get_future()` 落地。详见
+  [docs/experiments/m0-m4.md](docs/experiments/m0-m4.md)。
+- **待开发**：Megatron DP adapter 与 plan 版本切换，
   详见 [docs/phase1-plan.md](docs/phase1-plan.md)。
