@@ -1,0 +1,6 @@
+待讨论：
+1. scheduler的worker模式应该单开一个新类，而不是混合在原来的单线程分支里面
+2. scheduler的边界：是否应该像现在这样只手遮天完全处理整个collective的生命流程直到结束才返回训练stream
+    还是说scheduler只需要提供一个admission信号，让训练stream和正常情况一样自己处理collective的执行，
+    只不过是得到scheduler允许后再做，这样就可以沿用现有c10d的stream-ordered completion同步机制，不用
+    自己去处理一个nccl结束信号。
