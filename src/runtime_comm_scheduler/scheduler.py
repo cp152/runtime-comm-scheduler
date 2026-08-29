@@ -239,11 +239,13 @@ class AdmissionScheduler:
         return True
 
     def _drain(self, g: str) -> None:
-        """尽可能把队首且已 ready 的 pending intent 发射出去。
+        """worker-only（worker 模式下）：尽可能把队首且已 ready 的 pending
+        intent 发射出去。
 
-        同步模式由 submit/nudge/on_complete 直接调用（单线程）；worker 模式
-        由 ``_worker_loop`` 在持有 ``_lock`` 的情况下调用。两个模式下
-        ``_drain`` 本身都不取锁，由调用方保证。
+        同步模式（单线程）由 submit/nudge/on_complete 直接调用；worker 模式
+        只由 ``_worker_loop`` 在持有 ``_lock`` 的情况下调用，外部线程经
+        ``_on_work_complete`` 只释放槽位 + 唤醒，不直接进入这里。``_drain``
+        本身不取锁，由调用方保证。
         """
         while self._remaining[g]:
             head = self._remaining[g][0]
@@ -260,6 +262,10 @@ class AdmissionScheduler:
             self._admit_and_launch(g, intent, work)
 
     def _admit_and_launch(self, g: str, intent: CommIntent, work: ScheduledWork) -> None:
+        """worker-only：发射点。worker 模式只由 worker 线程经 ``_drain``
+        调用（同步模式由单线程链触发）；推进状态机、在 comm stream 上
+        ``launch_fn``、bind 底层 Work 并记账。任何其他线程不得直接发射。
+        """
         intent.transition(IntentState.WAITING_FOR_ADMISSION)
         intent.transition(IntentState.ADMITTED)
         intent.transition(IntentState.SUBMITTED)
@@ -287,7 +293,7 @@ class AdmissionScheduler:
         self._launched[g].append(intent.key)
 
     def _sync_ready_event(self, intent: CommIntent) -> None:
-        """发射前让当前 stream 等待 producer 的 CUDA ready event（M3）。
+        """worker-only：发射前让当前 stream 等待 producer 的 CUDA ready event（M3）。
 
         把 collective 排在 producer 的 GPU 工作之后（stream-ordered），
         而不是靠 CPU 阻塞；这样 stream dependency 由 GPU 侧 event 保证，
