@@ -133,6 +133,10 @@ comm stream」的完成信号。M3 发现 #2（4GB all_reduce `wait()` ~0.01ms �
 
 ## 重测结果（2026-08-24 实测）
 
+> 各实验（v1–v10）**逐字原始输出**（每 rank JSON）见
+> [experiments/wait-semantics-recheck-raw.md](experiments/wait-semantics-recheck-raw.md)，
+> 供逐组核对时间戳。以下为结论与决策映射。
+
 环境：AutoDL 2× RTX 3090（24GB），torch 2.12.1+cu130，CUDA 13.0，两 rank NCCL
 （各绑单卡，`env://`），**无 profiler**，非 legacy 显式流。harness：
 `examples/wait_recheck_worker_v2..v10.py` + `examples/run_wait_recheck_v2.py`。
