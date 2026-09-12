@@ -120,12 +120,13 @@ Plan {
   version,
   window_id,
   CommIntent 元数据集合,
-  每个 process group 的诱导子序列,   // 顺序不变量
+  确定性的全局逻辑 host launch 顺序,
+  每个 process group 的诱导子序列,
   plan_hash                          // 文档身份，非执行顺序
 }
 ```
 
-Plan 是一份**全 rank 共享的规范文档**（同一 version/window/hash），不是每 rank 各自的执行计划。`entries` 是确定性的共享载体；per-group 诱导子序列由它过滤得到，是唯一需要跨 rank 一致的顺序不变量。**每 rank 的实际执行序列是运行时投影**（把该 rank 所属各 group 的子序列按训练 DAG 依赖合并），不存入 plan，由 framework adapter 提交、scheduler 按 per-group 子序列校验。`plan_hash` 的语义是「所有 rank 安装同一份文档」，不等于执行顺序相等。
+Plan 是一份**全 rank 共享的规范文档**（同一 version/window/hash），不是每 rank 各自独立决定的执行计划。`entries` 的顺序是第一版保守的全局逻辑 host launch 顺序；每个 rank 删除自己不参与的 group task，得到本地投影，并由唯一 launch worker 按该投影提交。per-group 诱导子序列仍是 collective 匹配正确性的基本不变量。`plan_hash` 的语义是「所有 rank 安装同一份文档」，不等于各 rank 执行完全相同的 task 集合。
 
 Plan 由配置文件指定的通信 Task 序列或应用层提交的 CommIntent 序列实例化；当前骨架只保留 `CommIntent` 和 scheduler 边界。初期使用每 iteration 的静态有序 key 序列，后续再由 iteration `k` 的 telemetry 生成 `k+1` 的序列。
 
@@ -136,7 +137,7 @@ Admission 路径根据 plan 未固定的运行时状态做出有限调整：
 - producer 是否已经 ready；
 - 计划中的 collective 是否需要 delay；
 - outstanding collective 数量是否达到上限；
-- 不同 process group 中哪个 ready task 先发射；
+- 后续偏序版本中，ready frontier 内哪个跨 group task 先发射；
 - 当前运行时测量是否需要反馈给下一版本 plan。
 
 约束如下：
@@ -145,6 +146,11 @@ Admission 路径根据 plan 未固定的运行时状态做出有限调整：
 2. 不能在本地跳过或重排同一个 process group 的计划子序列。
 3. 只有在各成员 rank 的诱导序列仍然一致时，才允许进行跨 process group 仲裁。
 4. task 提交给 NCCL 后不能取消、抢占或重排。
+
+M4.5 的第一版采用保守全序：一个 rank/GPU 的所有受控 process group 共享同一个
+host launch worker，但每个 process group 使用独立 CUDA gate stream。host 调用
+顺序是 plan 投影的全序，不额外建立不同 communicator 之间的 GPU completion 或
+producer-ready 依赖。
 
 ## 6. 正确性模型
 
@@ -164,10 +170,17 @@ Admission 路径根据 plan 未固定的运行时状态做出有限调整：
 任务生命周期为：
 
 ```text
-CREATED -> READY -> WAITING_FOR_ADMISSION -> ADMITTED -> SUBMITTED -> COMPLETED
+CREATED -> READY -> WAITING_FOR_ADMISSION -> ADMITTED -> SUBMITTED
+                                                      -> COMPLETED | FAILED
 ```
 
 `SUBMITTED` 是不可逆边界。
+
+对 NCCL，`ScheduledWork.wait()` 负责将底层 completion dependency 接入调用时的
+consumer current stream，不表示 CPU 等待 GPU 物理完成。`COMPLETED` 只由经过验证
+的 backend completion probe 推进；普通依赖传递不得使用 device-wide synchronize。
+有限 `WorkNCCL.wait(timeout)` 是可能 abort communicator 的 backend 错误边界，不是
+nonblocking completion query；查询物理完成应使用已验证的 `is_completed()` probe。
 
 ## 7. Plan 版本切换
 
