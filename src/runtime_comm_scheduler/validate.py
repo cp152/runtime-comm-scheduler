@@ -3,7 +3,7 @@
 M1 验收覆盖五类问题：重复 key、缺失 key、metadata mismatch、plan hash
 mismatch、per-group sequence validation。所有校验函数在发现不一致时显式
 抛出 :class:`ValidationError`，而不是静默继续——这是正确性模型的核心
-要求（architecture.md §6：主动暴露 divergence，而非等待 NCCL 超时）。
+要求（docs/design/architecture.md §6：主动暴露 divergence，而非等待 NCCL 超时）。
 """
 
 from __future__ import annotations

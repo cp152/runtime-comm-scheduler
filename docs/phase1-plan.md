@@ -122,12 +122,18 @@ producer stream -> ready event -> communication stream
 communication completion -> completion event -> consumer stream
 ```
 
+对 NCCL，`ScheduledWork.wait()` 等待 underlying Work 被绑定，然后把 NCCL
+completion dependency 插入调用时的 consumer current stream；它不额外阻塞 CPU
+等待 GPU 物理完成，也不执行设备级同步。physical completion、outstanding slot
+释放与 `complete_ts` 由 backend completion probe 独立推进。
+
 ### 4.6 Telemetry
 
 每个 collective 记录：
 
 ```text
-ready_ts, admit_ts, submit_ts, complete_ts,
+intent_ts, ready_record_ts, admit_ts, launch_start_ts,
+submit_ts, first_wait_ts, complete_ts,
 predicted_duration, actual_duration
 ```
 
@@ -137,7 +143,8 @@ predicted_duration, actual_duration
 
 1. 每个 process group 在所有成员 rank 上看到相同的逻辑 `TaskKey` 序列。
 2. collective 不能在 producer ready 前提交。
-3. `ScheduledWork.wait()` 不能在底层 collective 完成前返回。
+3. `ScheduledWork.wait()` 返回后，consumer current stream 必须已经建立到底层
+   collective completion 的依赖；不要求 CPU 等待 GPU 物理完成。
 4. 本地 intent 与当前 plan 不一致时不能静默继续。
 5. collective 提交后不能取消、抢占或重排。
 6. scheduler 出错时必须显式失败或按文档化规则 FIFO fallback，不能无限静默挂起。
@@ -181,13 +188,30 @@ submit intent -> 校验 plan -> admission -> 调用原始 async collective
 
 加入 CUDA event 和 profiler instrumentation，明确区分 ready、admission、submission 和 completion。
 
-验收：profiler/Nsight 证明 stream dependency 正确，`wait()` 不会提前返回。
+验收：profiler/Nsight 证明 producer 和 consumer 两侧 stream dependency 正确；
+`wait()` 不引入 device-wide synchronization。
 
 ### M4：V1 异步 admission worker
 
 把 deferred launch 移到 scheduler worker 和显式 communication stream。首先验证 ProcessGroupNCCL 是否允许 worker thread 提交 collective。如果不可靠，应记录限制并评估后续 C++ enforcer，不要用未验证的锁机制掩盖问题。
 
 验收：producer 在提交 intent 后可以继续执行，consumer 通过 `ScheduledWork` 等待；没有错误的 stream dependency 或 sequence divergence。
+
+### M4.5：单 Launch Executor 与 Work 语义重构
+
+状态：**完成**。原 3090 容器下线后，GPU capability gate 经批准改在 2× RTX
+3080 Ti、PyTorch 2.12.1+cu130 环境执行并通过；记录见
+[experiments/m4.5-gpu3080.md](experiments/m4.5-gpu3080.md)。
+
+删除 training-thread 同步 launch 兼容路径。每个 rank/GPU 只保留一个 host launch
+worker，按共享 plan 的本地投影为所有受控 process group 排序提交；不同 process
+group 使用独立 gate stream，避免跨 communicator producer-ready 串联。
+`ScheduledWork.wait()` 恢复底层 stream-ordered 语义，物理完成由 completion probe
+观察。
+
+验收：无 `_worker_mode` 分支或设备级同步；rank-wide launch order 是共享 plan 的
+合法投影；completion/outstanding 不依赖 consumer wait；错误和关闭不会留下永久
+等待的未绑定 work。详细计划见 [m4.5-refactor-plan.md](m4.5-refactor-plan.md)。
 
 ### M5：Megatron DP gradient adapter
 

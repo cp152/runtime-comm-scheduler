@@ -1,18 +1,16 @@
-"""ScheduledWork：延迟绑定的分布式 Work 兼容边界。
+"""Deferred binding boundary for scheduler-managed collective work.
 
-M2 的创建时机在 admission 之前：intent 提交时立刻返回 ``ScheduledWork``，
-但底层 collective 可能尚未发射（parked）。发射时由 scheduler 调用
-:meth:`bind` 把原始 ``Work`` 挂上来，``wait``/``is_completed`` 再透传到
-底层 Work。完成时记录 telemetry 并把 intent 推进到 ``COMPLETED``。
-
-M3 起 ``wait`` 对 c10d Work 在底层 wait 后补一次设备同步（见
-:func:`_ensure_gpu_complete`）：本环境实测裸 ``WorkNCCL.wait()`` 会在
-collective 的 GPU 工作完成前就返回，只透传无法兑现"不提前返回"的契约。
+``ScheduledWork.wait`` preserves the underlying backend's wait contract. In
+particular, ProcessGroupNCCL wait inserts a completion dependency into the
+caller's current CUDA stream; it is not turned into a device-wide CPU wait.
+Physical completion is observed independently by the scheduler's completion
+probe.
 """
 
 from __future__ import annotations
 
 import threading
+import time
 from datetime import timedelta
 from typing import Any, Callable, Optional
 
@@ -20,46 +18,22 @@ from .intent import CommIntent, IntentState
 from .telemetry import CommTiming, now_us
 
 
-def _ensure_gpu_complete(underlying: Any) -> None:
-    """补偿 c10d Work 在 NCCL 下不可靠的完成语义（M3 发现）。
-
-    torch 2.12.1+cu130 / NCCL comm stream 上实测：裸 ``WorkNCCL.wait()``
-    对 4GB all_reduce 也在 ~0.01ms 内返回，而 GPU 工作要等后续
-    ``torch.cuda.synchronize()`` 才排空（~570ms）。即 wait 返回不意味着
-    collective 完成。这里对真正的 c10d Work 补一次设备同步，保证
-    ``ScheduledWork.wait()`` 的完成信号真实反映 GPU 完成。
-    代价是每次 wait 全设备同步；M4 换成 comm-stream completion event 消除。
-    非 c10d Work（测试里的 FakeWork 等）或未启用 CUDA 时不做任何事。
-    """
-    try:
-        import torch  # 惰性导入，包不强制依赖 torch
-    except ImportError:
-        return
-    if not torch.cuda.is_available():
-        return
-    mod = type(underlying).__module__ or ""
-    # c10d 的 Work（NCCL/Gloo）定义在 torch._C._distributed_c10d 下。
-    if not (mod.startswith("torch._C") or mod.startswith("torch.distributed")):
-        return
-    torch.cuda.synchronize()
-
-
 class ScheduledWork:
-    """延迟绑定的底层分布式 Work 的包装边界。"""
+    """A Work-like object that may be returned before ProcessGroup launch."""
 
     def __init__(
         self,
         intent: CommIntent,
         timing: CommTiming,
         *,
-        on_complete: Optional[Callable[[], None]] = None,
+        on_error: Optional[Callable[["ScheduledWork", BaseException], None]] = None,
     ) -> None:
         self._intent = intent
         self._timing = timing
-        self._on_complete = on_complete
+        self._on_error = on_error
+        self._condition = threading.Condition()
         self._underlying: Optional[Any] = None
-        self._launched = threading.Event()
-        self._lock = threading.Lock()
+        self._error: Optional[BaseException] = None
         self._completed = False
 
     @property
@@ -70,89 +44,141 @@ class ScheduledWork:
     def timing(self) -> CommTiming:
         return self._timing
 
+    @property
+    def intent(self) -> CommIntent:
+        return self._intent
+
+    @property
+    def is_bound(self) -> bool:
+        with self._condition:
+            return self._underlying is not None
+
     def bind(self, underlying: Any) -> None:
-        """把已发射 collective 返回的底层 ``Work`` 绑定到本包装对象。"""
-        with self._lock:
+        """Bind the asynchronous Work returned by the launch executor."""
+        with self._condition:
             if self._underlying is not None:
-                raise RuntimeError(f"ScheduledWork {self._intent.key} already bound")
+                raise RuntimeError(f"ScheduledWork {self.key} already bound")
+            if self._error is not None:
+                raise RuntimeError(f"ScheduledWork {self.key} already failed")
             self._underlying = underlying
-        self._launched.set()
+            self._condition.notify_all()
+
+    def fail(self, error: BaseException) -> bool:
+        """Make all current/future waiters observe ``error``.
+
+        Returns ``True`` only for the first transition to failure.
+        """
+        with self._condition:
+            if self._error is not None or self._completed:
+                return False
+            self._error = error
+            self._condition.notify_all()
+            return True
 
     def wait(self, timeout: Optional[float] = None) -> bool:
-        """等待发射与完成；``timeout`` 期间未发射或未完成时返回 False。
+        """Wait for binding, then delegate to the underlying Work.
 
-        ``timeout=None`` 表示无限等待——对应 M0 观察到的缺失 collective
-        挂起语义，但在这里是 scheduler 层的有界契约，由 harness 的超时兜底。
+        For ProcessGroupNCCL this inserts the NCCL completion dependency into
+        the CUDA stream current at this call site and can return before GPU
+        execution physically completes. No device/stream synchronization is
+        added by this wrapper.
+
+        ``timeout`` is one total deadline covering both deferred binding and
+        the underlying wait. c10d Work accepts a ``datetime.timedelta``.
+        A positive ProcessGroupNCCL timeout is a backend failure boundary that
+        can abort the communicator; it must not be used as a completion poll.
         """
-        if not self._launched.wait(timeout):
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be non-negative or None")
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        with self._condition:
+            while self._underlying is None and self._error is None:
+                remaining = self._remaining(deadline)
+                if remaining == 0:
+                    return False
+                self._condition.wait(remaining)
+            if self._error is not None:
+                raise self._error
+            underlying = self._underlying
+            if self._timing.first_wait_ts is None:
+                self._timing.first_wait_ts = now_us()
+
+        if underlying is None:  # defensive: condition predicate guarantees it
             return False
-        with self._lock:
+        try:
+            remaining = self._remaining(deadline)
+            if remaining == 0:
+                if not bool(underlying.is_completed()):
+                    return False
+                # Preserve CUDA consumer-stream dependency insertion even for
+                # a zero-timeout query that observes an already-complete Work.
+                return bool(underlying.wait())
+            if remaining is None:
+                return bool(underlying.wait())
+            return bool(underlying.wait(timeout=timedelta(seconds=remaining)))
+        except BaseException as exc:  # noqa: BLE001 - preserve backend error
+            first = self.fail(exc)
+            if first and self._on_error is not None:
+                self._on_error(self, exc)
+            raise
+
+    def is_completed(self) -> bool:
+        """Return physical completion if bound, otherwise ``False``.
+
+        Scheduler completion polling remains authoritative for lifecycle and
+        telemetry updates; this observation does not itself release admission
+        capacity.
+        """
+        with self._condition:
+            if self._error is not None:
+                raise self._error
+            if self._completed:
+                return True
             underlying = self._underlying
         if underlying is None:
             return False
-        # c10d Work.wait 只接受 timedelta；None 表示无限等待（不传参）。
-        if timeout is None:
-            done = underlying.wait()
-        else:
-            done = underlying.wait(timeout=timedelta(seconds=timeout))
-        if done:
-            # 底层 wait 返回不等于 GPU 完成（M3 发现），先补同步再标记完成。
-            _ensure_gpu_complete(underlying)
-            self._mark_completed()
-        return done
+        try:
+            return bool(underlying.is_completed())
+        except BaseException as exc:  # noqa: BLE001
+            first = self.fail(exc)
+            if first and self._on_error is not None:
+                self._on_error(self, exc)
+            raise
 
-    def is_completed(self) -> bool:
-        """已发射且底层 Work 已完成（未发射时恒为 False）。"""
-        with self._lock:
+    def underlying(self) -> Any:
+        """Return the bound Work for scheduler-owned completion polling."""
+        with self._condition:
+            if self._error is not None:
+                raise self._error
             if self._underlying is None:
-                return False
-            return bool(self._underlying.is_completed())
+                raise RuntimeError(f"ScheduledWork {self.key} is not bound")
+            return self._underlying
 
-    def get_future(self) -> "ScheduledFuture":
-        """返回完成 future（M4）：``result()`` 内部走 ``wait()`` 以兑现
-        GPU 完成保证，任意线程调用均安全；``done()`` 透传 ``is_completed``。
-
-        完成检测需要设备同步（M3 发现：裸 Work.wait() 不可靠），因此 future
-        不能靠 worker 侧轮询异步解析，只能在 ``wait()``/``result()`` 调用点
-        推进——它是 ``wait()`` 的便利接口，不是零开销的异步回调。
-        """
-        return ScheduledFuture(self)
-
-    def _mark_completed(self) -> None:
-        with self._lock:
+    def mark_completed(self) -> bool:
+        """Record backend-observed physical completion exactly once."""
+        with self._condition:
             if self._completed:
-                return
+                return False
+            if self._error is not None:
+                return False
+            if self._underlying is None:
+                raise RuntimeError(f"cannot complete unbound work {self.key}")
             self._completed = True
-        self._timing.complete_ts = now_us()
-        if (
-            self._timing.submit_ts is not None
-            and self._timing.complete_ts is not None
-        ):
+            self._condition.notify_all()
+
+        complete_ts = now_us()
+        self._timing.complete_ts = complete_ts
+        if self._timing.submit_ts is not None:
             self._timing.actual_duration_us = float(
-                self._timing.complete_ts - self._timing.submit_ts
+                complete_ts - self._timing.submit_ts
             )
-        self._intent.transition(IntentState.COMPLETED)
-        if self._on_complete is not None:
-            self._on_complete()
+        if self._intent.state is IntentState.SUBMITTED:
+            self._intent.transition(IntentState.COMPLETED)
+        return True
 
-
-class ScheduledFuture:
-    """``ScheduledWork.get_future()`` 的完成 future（M4）。
-
-    与 ``ScheduledWork.wait()`` 共享完成语义：``result()`` 内部走
-    ``wait()``（含 M3 的设备同步补偿），因此从任意线程调用都兑现
-    「不提前返回」的契约；``done()`` 透传 ``is_completed()``。
-    """
-
-    def __init__(self, work: ScheduledWork) -> None:
-        self._work = work
-
-    def result(self, timeout: Optional[float] = None) -> bool:
-        """等待完成并返回是否成功（``False`` 表示超时未完成）。"""
-        return self._work.wait(timeout=timeout)
-
-    def done(self) -> bool:
-        return self._work.is_completed()
-
-    def cancelled(self) -> bool:
-        return False
+    @staticmethod
+    def _remaining(deadline: Optional[float]) -> Optional[float]:
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())

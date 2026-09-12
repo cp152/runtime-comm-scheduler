@@ -96,3 +96,34 @@ def test_lifecycle_no_transition_after_completed():
     # COMPLETED 是终态
     with pytest.raises(ValueError):
         intent.transition(IntentState.SUBMITTED)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        [],
+        [IntentState.READY],
+        [IntentState.READY, IntentState.WAITING_FOR_ADMISSION],
+        [
+            IntentState.READY,
+            IntentState.WAITING_FOR_ADMISSION,
+            IntentState.ADMITTED,
+        ],
+        [
+            IntentState.READY,
+            IntentState.WAITING_FOR_ADMISSION,
+            IntentState.ADMITTED,
+            IntentState.SUBMITTED,
+        ],
+    ],
+)
+def test_lifecycle_can_fail_from_every_nonterminal_stage(path):
+    intent = CommIntent(
+        key=_key(), op="all_reduce", tensor=None, process_group=None, num_bytes=8
+    )
+    for state in path:
+        intent.transition(state)
+    intent.transition(IntentState.FAILED)
+    assert intent.state is IntentState.FAILED
+    with pytest.raises(ValueError):
+        intent.transition(IntentState.COMPLETED)

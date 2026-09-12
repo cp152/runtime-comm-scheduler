@@ -138,6 +138,21 @@ def test_group_sequence_order_preserved():
     assert plan.group_sequence("tp") == (_key(1, process_group_id="tp"),)
 
 
+def test_local_projection_preserves_global_order_and_skips_nonlocal_groups():
+    dp0 = _key(0, process_group_id="dp")
+    tp0 = _key(1, process_group_id="tp")
+    dp1 = _key(2, process_group_id="dp")
+    plan = _plan(
+        [
+            (dp0, "all_reduce", 8),
+            (tp0, "all_reduce", 8),
+            (dp1, "all_reduce", 8),
+        ]
+    )
+    assert plan.local_projection({"dp"}) == (dp0, dp1)
+    assert plan.local_projection({"dp", "tp"}) == (dp0, tp0, dp1)
+
+
 def test_group_sequence_divergence_raises():
     a = _plan(
         [

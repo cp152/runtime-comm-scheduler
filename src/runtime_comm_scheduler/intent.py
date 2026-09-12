@@ -29,7 +29,8 @@ class IntentState(enum.Enum):
     """任务生命周期状态。
 
     ``CREATED -> READY -> WAITING_FOR_ADMISSION -> ADMITTED
-    -> SUBMITTED -> COMPLETED``。``SUBMITTED`` 是不可逆边界。
+    -> SUBMITTED -> COMPLETED``；任一非终态也可以进入 ``FAILED``。
+    ``SUBMITTED`` 是不可取消边界。
     """
 
     CREATED = "created"
@@ -38,16 +39,18 @@ class IntentState(enum.Enum):
     ADMITTED = "admitted"
     SUBMITTED = "submitted"
     COMPLETED = "completed"
+    FAILED = "failed"
 
 
 # 允许的单调前向转移。状态只能前进，不能回退（``SUBMITTED`` 之后不可取消）。
 _TRANSITIONS: dict[IntentState, tuple[IntentState, ...]] = {
-    IntentState.CREATED: (IntentState.READY,),
-    IntentState.READY: (IntentState.WAITING_FOR_ADMISSION,),
-    IntentState.WAITING_FOR_ADMISSION: (IntentState.ADMITTED,),
-    IntentState.ADMITTED: (IntentState.SUBMITTED,),
-    IntentState.SUBMITTED: (IntentState.COMPLETED,),
+    IntentState.CREATED: (IntentState.READY, IntentState.FAILED),
+    IntentState.READY: (IntentState.WAITING_FOR_ADMISSION, IntentState.FAILED),
+    IntentState.WAITING_FOR_ADMISSION: (IntentState.ADMITTED, IntentState.FAILED),
+    IntentState.ADMITTED: (IntentState.SUBMITTED, IntentState.FAILED),
+    IntentState.SUBMITTED: (IntentState.COMPLETED, IntentState.FAILED),
     IntentState.COMPLETED: (),
+    IntentState.FAILED: (),
 }
 
 
@@ -103,6 +106,8 @@ class CommIntent:
     producer: Optional[str] = None                      # 训练 DAG 生产者描述（可选）
     consumer: Optional[str] = None                      # 训练 DAG 消费者描述（可选）
     ready_event: Any = None                             # CUDA ready event，表示 tensor 已可通信
+    device: Any = None                                  # rank-local 执行 device（可选）
+    keepalive: tuple[Any, ...] = ()                     # pending 阶段必须存活的附加对象
     state: IntentState = field(default=IntentState.CREATED)
 
     def transition(self, new_state: IntentState) -> None:

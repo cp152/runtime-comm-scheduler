@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Collection, Iterable
 
 from .intent import CommIntent, TaskKey, stable_dumps
 
@@ -57,6 +57,18 @@ class Plan:
             if k.process_group_id not in seen:
                 seen.append(k.process_group_id)
         return tuple(seen)
+
+    def local_projection(
+        self,
+        local_group_ids: Collection[str],
+    ) -> tuple[TaskKey, ...]:
+        """返回共享 plan 在当前 rank 所参与 group 上的有序投影。
+
+        不参与某个 process group 的 rank 直接跳过其 task，不创建占位
+        collective。返回序列保持 ``entries`` 的全局 host launch 顺序。
+        """
+        groups = frozenset(local_group_ids)
+        return tuple(k for k in self.keys if k.process_group_id in groups)
 
     def digest(self) -> str:
         """plan 的确定性 hash，覆盖 version、window_id 与有序 entry 元数据。"""

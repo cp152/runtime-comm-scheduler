@@ -12,9 +12,9 @@ completion-event 查询结果）。
   stream ``wait_event``，collective 排到 producer 之后（正确结果）；
   ``no_wait_ready`` 去掉该 event 作为对照，collective 与 producer 竞争
   （结果错误/不确定），证明依赖边是必需的。
-- **wait() 不提前返回**：``wait_no_early_return`` 在发射后在当前 stream
-  记录 completion event，``Work.wait()`` 之前 ``query()`` 必须为 False，
-  之后为 True。
+- **stream-ordered wait**：``wait_stream_ordered`` 验证 ``Work.wait()`` 把
+  NCCL completion dependency 接入 consumer stream，但不阻塞 CPU 等待 GPU
+  物理完成。
 
 其余场景（fifo/fixed_reorder/op_mismatch）与 M2 对齐，验证 NCCL 下
 plan 校验与固定重排的安全性，错误场景 fail-stop 有界退出。
@@ -32,11 +32,17 @@ import torch
 import torch.distributed as dist
 import torch.profiler
 
-from runtime_comm_scheduler import AdmissionScheduler, CommIntent, Plan, TaskKey
+from runtime_comm_scheduler import (
+    AdmissionScheduler,
+    CommIntent,
+    Plan,
+    TaskKey,
+    TorchProcessGroupExecutor,
+)
 from runtime_comm_scheduler.validate import ValidationError
 
 _N = 1024  # tensor 大小（float32 元素数）
-# wait_no_early_return 用较大的 collective 让 wait() 的阻塞时长可测。
+# wait_stream_ordered 用较大的 collective 让依赖边保持可观测。
 _WAIT_N = 64 * 1024 * 1024  # 256MB float32 -> all_reduce GPU 时间 ~20ms
 
 
@@ -45,10 +51,12 @@ def _key(ordinal: int) -> TaskKey:
 
 
 def _build_plan(scenario: str) -> Plan:
-    n = _WAIT_N if scenario == "wait_no_early_return" else _N
+    n = _WAIT_N if scenario == "wait_stream_ordered" else _N
     ar = ("all_reduce", n * 4)
     if scenario == "fixed_reorder":
         entries = ((_key(1), *ar), (_key(0), *ar))
+    elif scenario in ("delayed_ready", "no_wait_ready", "wait_stream_ordered"):
+        entries = ((_key(0), *ar),)
     else:
         entries = ((_key(0), *ar), (_key(1), *ar))
     return Plan(version=0, window_id=0, entries=tuple(entries))
@@ -107,7 +115,7 @@ def _make_all_gather(key: TaskKey, rank: int, world: int):
 
     intent = CommIntent(
         key=key, op="all_gather", tensor=tensor, process_group=None,
-        num_bytes=_N * 4, launch_fn=launch,
+        num_bytes=_N * 4, launch_fn=launch, keepalive=tuple(gathered),
     )
     return intent
 
@@ -116,7 +124,12 @@ def _run(scenario: str, rank: int, world: int, local_rank: int, trace_dir: str) 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl")
     _warmup_nccl()  # 去掉首 op 的 lazy init 延迟（见函数注释）
-    sched = AdmissionScheduler(_build_plan(scenario))
+    plan = _build_plan(scenario)
+    sched = AdmissionScheduler(
+        plan,
+        local_group_ids=plan.group_ids(),
+        executor=TorchProcessGroupExecutor(local_rank),
+    )
     out: dict = {"rank": rank, "scenario": scenario, "status": "ok", "ops": []}
 
     with torch.profiler.profile(
@@ -203,66 +216,60 @@ def _run(scenario: str, rank: int, world: int, local_rank: int, trace_dir: str) 
                 assert wa.wait() and av()
                 out["ops"] = [{"key": 0, "ok": av()}]
 
-            elif scenario == "wait_no_early_return":
-                # 证明 wait() 不提前返回：submit 立即返回（CPU 异步），但
-                # wait() 必须阻塞到该 intent 的 GPU 工作真正完成。
-                #
-                # 本环境实测的 M3 语义（2x3090 / torch 2.12.1+cu130）：
-                # 1) NCCL 跑在独立 comm stream，naive 记在当前 stream 的
-                #    event 不会等待 NCCL 完成（当前 stream 空闲时 event 立即
-                #    触发）；2) 裸 WorkNCCL.wait() 在 collective 的 GPU 工作
-                #    完成前就返回（4GB all_reduce 实测 wait~0.01ms，
-                #    sync_after~570ms）。因此 ScheduledWork.wait() 对 c10d
-                #    Work 在底层 wait 后补一次设备同步，保证完成信号真实。
-                #
-                # 场景构造：当前 stream 先排一段短 matmul 占位（延迟 completion
-                # event 的触发，使 wait 前的 query 确定性地落在 GPU 忙碌期），
-                # 随后发射一个较大的 all_reduce（wait() 的阻塞时长主要由
-                # collective 的 GPU 时间构成，> 10ms 验收阈值）。
+            elif scenario == "wait_stream_ordered":
+                # wait() 只把 NCCL completion dependency 接入 consumer stream。
+                # CPU 返回时 consumer event 可以仍未触发；同步 consumer stream
+                # 后依赖满足且 collective 输出可安全使用。
                 k = _key(0)
                 tensor = torch.full((_WAIT_N,), -1.0, device="cuda")
                 tensor.fill_(rank + 1)
-                comp_ev = torch.cuda.Event()
 
                 def launch():
                     a = torch.randn(2048, 2048, device="cuda")
                     for _ in range(10):
-                        a = a @ a  # 当前 stream 短占位（~5ms），延迟 event 触发
-                    w = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-                    comp_ev.record(torch.cuda.current_stream())
-                    return w
+                        a = a @ a
+                    return dist.all_reduce(
+                        tensor, op=dist.ReduceOp.SUM, async_op=True
+                    )
 
                 intent = CommIntent(
                     key=k, op="all_reduce", tensor=tensor, process_group=None,
                     num_bytes=_WAIT_N * 4, launch_fn=launch,
                 )
                 w = sched.submit(intent)
-                before = bool(comp_ev.query())
+                consumer = torch.cuda.Stream()
+                consumer_after = torch.cuda.Event()
                 t0 = time.perf_counter()
-                assert w.wait()
+                with torch.cuda.stream(consumer):
+                    assert w.wait()
+                    consumer_after.record()
                 wait_s = round(time.perf_counter() - t0, 3)
-                after = bool(comp_ev.query())
+                after_return = bool(consumer_after.query())
+                consumer.synchronize()
+                after_sync = bool(consumer_after.query())
                 ok = bool(torch.all(tensor == world * (world + 1) / 2).item())
                 out["ops"] = [
                     {"key": 0, "ok": ok,
-                     "comp_query_before_wait": before,
-                     "comp_query_after_wait": after,
+                     "consumer_after_wait_return": after_return,
+                     "consumer_after_stream_sync": after_sync,
                      "wait_s": wait_s},
                 ]
 
             else:
                 raise ValueError(f"unknown scenario: {scenario!r}")
 
+            if scenario != "op_mismatch":
+                sched.finish_window(timeout=30)
             out["launched_seq"] = {
                 g: [k.as_list() for k in keys]
-                for g, keys in sched.sequence_log().items()
+                for g, keys in sched.group_sequence_log().items()
             }
             for t in sched.timings():
                 op = next(
                     (o for o in out["ops"] if o["key"] == t.key.ordinal), {}
                 )
                 op.update({
-                    "ready_us": t.ready_ts,
+                    "ready_us": t.ready_record_ts,
                     "admit_us": t.admit_ts,
                     "submit_us": t.submit_ts,
                     "complete_us": t.complete_ts,
@@ -272,7 +279,10 @@ def _run(scenario: str, rank: int, world: int, local_rank: int, trace_dir: str) 
             out["status"] = "error"
             out["error"] = f"{type(exc).__name__}: {exc}"
         finally:
-            dist.destroy_process_group()
+            try:
+                sched.close()
+            finally:
+                dist.destroy_process_group()
 
     prof.export_chrome_trace(os.path.join(trace_dir, f"trace_r{rank}_{scenario}.json"))
     return out

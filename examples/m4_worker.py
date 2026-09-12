@@ -1,6 +1,6 @@
 """M4 单 rank worker：两 rank NCCL 上的异步 admission worker harness。
 
-由 ``run_m4.py`` 驱动，NCCL backend，``AdmissionScheduler(worker=True)``：
+由 ``run_m4.py`` 驱动，NCCL backend，worker-only ``AdmissionScheduler``：
 deferred launch 由专门的 worker 线程在显式 communication stream 上执行，
 producer（主线程）的 ``submit`` 只校验 + park + 唤醒并立即返回。
 
@@ -32,7 +32,13 @@ import time
 import torch
 import torch.distributed as dist
 
-from runtime_comm_scheduler import AdmissionScheduler, CommIntent, Plan, TaskKey
+from runtime_comm_scheduler import (
+    AdmissionScheduler,
+    CommIntent,
+    Plan,
+    TaskKey,
+    TorchProcessGroupExecutor,
+)
 from runtime_comm_scheduler.validate import ValidationError
 
 _N = 1024           # 普通场景 tensor 大小（float32 元素数）
@@ -54,6 +60,8 @@ def _build_plan(scenario: str) -> Plan:
     ar = ("all_reduce", n * 4)
     if scenario == "fixed_reorder":
         entries = ((_key(1), *ar), (_key(0), *ar))
+    elif scenario in ("delayed_ready", "no_wait_ready"):
+        entries = ((_key(0), *ar),)
     else:
         entries = ((_key(0), *ar), (_key(1), *ar))
     return Plan(version=0, window_id=0, entries=tuple(entries))
@@ -96,10 +104,12 @@ def _run(scenario: str, rank: int, world: int, local_rank: int) -> dict:
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl")
     _warmup_nccl()  # 去掉首 op 的 lazy init 延迟（见 M3 注释）
-    # M4：scheduler 持有显式 communication stream，worker 在其上发射。
-    comm_stream = torch.cuda.Stream()
-    sched = AdmissionScheduler(_build_plan(scenario), worker=True,
-                               comm_stream=comm_stream)
+    plan = _build_plan(scenario)
+    sched = AdmissionScheduler(
+        plan,
+        local_group_ids=plan.group_ids(),
+        executor=TorchProcessGroupExecutor(local_rank),
+    )
     out: dict = {"rank": rank, "scenario": scenario, "status": "ok", "ops": []}
 
     try:
@@ -219,16 +229,18 @@ def _run(scenario: str, rank: int, world: int, local_rank: int) -> dict:
         else:
             raise ValueError(f"unknown scenario: {scenario!r}")
 
+        if scenario != "op_mismatch":
+            sched.finish_window(timeout=30)
         out["launched_seq"] = {
             g: [k.as_list() for k in keys]
-            for g, keys in sched.sequence_log().items()
+            for g, keys in sched.group_sequence_log().items()
         }
         for t in sched.timings():
             op = next(
                 (o for o in out["ops"] if o["key"] == t.key.ordinal), {}
             )
             op.update({
-                "ready_us": t.ready_ts,
+                "ready_us": t.ready_record_ts,
                 "admit_us": t.admit_ts,
                 "submit_us": t.submit_ts,
                 "complete_us": t.complete_ts,
@@ -238,8 +250,10 @@ def _run(scenario: str, rank: int, world: int, local_rank: int) -> dict:
         out["status"] = "error"
         out["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        sched.close()
-        dist.destroy_process_group()
+        try:
+            sched.close()
+        finally:
+            dist.destroy_process_group()
     return out
 
 
@@ -254,7 +268,7 @@ def _make_all_gather(key: TaskKey, rank: int, world: int):
 
     intent = CommIntent(
         key=key, op="all_gather", tensor=tensor, process_group=None,
-        num_bytes=_N * 4, launch_fn=launch,
+        num_bytes=_N * 4, launch_fn=launch, keepalive=tuple(gathered),
     )
     return intent
 

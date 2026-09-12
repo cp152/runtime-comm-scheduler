@@ -14,9 +14,8 @@ thread 提交 ProcessGroupNCCL 是否足以支撑 prototype？」：
   提交（各自独立 tensor），探测 c10d/NCCL 的线程安全边界。信息性场景：
   M4 正式设计中只有 worker 线程提交，此场景只是摸清并发提交的可靠性包络。
 
-完成语义：M3 实测裸 ``WorkNCCL.wait()`` 不保证 GPU 完成，这里在数据校验前
-统一 ``torch.cuda.synchronize()``。stream 精确语义（comm-stream completion
-event）留待 M4 正式 harness。
+这些历史 gate 在最终数据校验前统一 ``torch.cuda.synchronize()``，仅用于排空
+实验 workload；scheduler 的正常 consumer 依赖传递不应采用设备级同步。
 """
 
 from __future__ import annotations

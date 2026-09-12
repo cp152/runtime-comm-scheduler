@@ -6,8 +6,8 @@
     python run_m3.py --only fifo    # 只跑一个场景
 
 每个场景两 rank 各跑一张 GPU（``CUDA_VISIBLE_DEVICES=<rank>``）。验收
-（phase1-plan M3）：profiler/Nsight 证明 stream dependency 正确、``wait()``
-不会提前返回；FIFO/固定重排安全且 sequence log 相同。
+（phase1-plan M3/M4.5）：profiler/Nsight 证明 stream dependency 正确，且
+``wait()`` 保持 stream-ordered 语义；FIFO/固定重排安全且 sequence log 相同。
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _WORKER = os.path.join(_HERE, "m3_worker.py")
-_TRACE_DIR = "/root/autodl-tmp/m3_traces"
+_TRACE_DIR = os.environ.get("RCS_M3_TRACE_DIR", "/root/autodl-tmp/m3_traces")
 
 # 场景 -> (超时秒数, 期望的 status)
 SCENARIOS = {
@@ -30,7 +30,7 @@ SCENARIOS = {
     "delayed_ready": (60, "ok"),
     "no_wait_ready": (60, "ok"),          # status 仍为 ok，op.ok 预期 False（竞争）
     "op_mismatch": (60, "validation_error"),
-    "wait_no_early_return": (60, "ok"),
+    "wait_stream_ordered": (60, "ok"),
 }
 
 
@@ -111,10 +111,10 @@ def _summarize(r: dict) -> str:
                     f"submit={op['submit_us']} complete={op['complete_us']} "
                     f"actual={op['actual_us']}us"
                 )
-            if "comp_query_before_wait" in op:
+            if "consumer_after_wait_return" in op:
                 parts.append(
-                    f"comp_before_wait={op['comp_query_before_wait']} "
-                    f"after_wait={op['comp_query_after_wait']} "
+                    f"after_wait_return={op['consumer_after_wait_return']} "
+                    f"after_stream_sync={op['consumer_after_stream_sync']} "
                     f"wait_s={op.get('wait_s')}"
                 )
             lines.append(f"      r{rank} " + " ".join(parts))
@@ -129,22 +129,18 @@ def _summarize(r: dict) -> str:
             lines.append("      ACCEPT: both ranks completed (race demonstrated)")
         else:
             lines.append("      REJECT: statuses do not match")
-    elif r["scenario"] == "wait_no_early_return":
+    elif r["scenario"] == "wait_stream_ordered":
         oks = [x for x in results if x.get("status") == "ok" and x.get("ops")]
-        befores = {x["ops"][0]["comp_query_before_wait"] for x in oks}
-        afters = {x["ops"][0]["comp_query_after_wait"] for x in oks}
-        waits = [x["ops"][0].get("wait_s", 0) for x in oks]
-        # wait() 必须阻塞到 GPU 工作完成：事件在 wait 前未触发、之后触发，
-        # 且阻塞时长 >= 慢 kernel 的 GPU 工作时间（阈值 10ms）。
-        if (statuses == {"ok"} and befores == {False} and afters == {True}
-                and all(w >= 0.01 for w in waits)):
+        returns = {x["ops"][0]["consumer_after_wait_return"] for x in oks}
+        syncs = {x["ops"][0]["consumer_after_stream_sync"] for x in oks}
+        if statuses == {"ok"} and returns == {False} and syncs == {True}:
             lines.append(
-                "      ACCEPT: wait() does not return early "
-                f"(comp event False before wait, True after; wait_s={waits})"
+                "      ACCEPT: wait() inserts a consumer-stream dependency "
+                "without waiting for physical GPU completion"
             )
         else:
             lines.append(
-                f"      REJECT: before={befores} after={afters} waits={waits}"
+                f"      REJECT: after_return={returns} after_sync={syncs}"
             )
     elif statuses == {r["expect"]} and r["expect"] == "ok":
         seqs = {tuple(str(s) for s in x["launched_seq"].values()) for x in results}

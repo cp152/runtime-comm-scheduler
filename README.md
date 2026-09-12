@@ -79,14 +79,14 @@ CommIntent
   -> WAITING_FOR_ADMISSION
   -> ADMITTED
   -> SUBMITTED
-  -> COMPLETED
+  -> COMPLETED | FAILED
 ```
 
-`READY`、`SUBMITTED` 和 `COMPLETED` 是不同事件。scheduler 只能在 `SUBMITTED` 之前介入；collective 一旦提交给 NCCL，就不能在当前层级取消或抢占。
+`READY`、`SUBMITTED` 和 `COMPLETED` 是不同事件。scheduler 只能在 `SUBMITTED` 之前介入；collective 一旦提交给 NCCL，就不能在当前层级取消或抢占。对 NCCL，`ScheduledWork.wait()` 表示把完成依赖接入 consumer current stream，不等同于 GPU 物理完成；后者由 completion probe 独立观察。
 
 ## 目录结构
 
-- `docs/architecture.md`：长期维护的系统边界、事件模型、机制和正确性约束。
+- `docs/design/architecture.md`：长期维护的系统边界、事件模型、机制和正确性约束。
 - `docs/phase1-plan.md`：当前 Phase 1 的目标、设计、里程碑和验收标准。
 - `docs/experiments/`：实验记录和 profiler/Nsight 产物索引。
 - `src/runtime_comm_scheduler/`：机制接口和后续实现。
@@ -105,17 +105,23 @@ CommIntent
   准入 → 发射路径，两 rank Gloo harness 重现 FIFO 与固定重排且 sequence log
   一致，乱序提交被强制为计划顺序，错误场景 fail-stop 有界退出。
 - **M3（NCCL/CUDA event 语义）已完成**：在两台 RTX 3090 上验证 CUDA ready
-  event 的 stream-dependency 机制与 `wait()` 完成语义。发现并补偿了两个
-  关键点：naive 当前 stream event 不追踪 NCCL（comm stream）完成；本环境下裸
-  `Work.wait()` 不保证 GPU 完成（由 `ScheduledWork.wait()` 内补一次设备同步
-  保证）。两 rank NCCL harness 六场景全部通过。
+  event 的 producer dependency。M3 当时把 `Work.wait()` 错误解释为 GPU 物理
+  完成等待并加入了设备同步；该解释和补偿已由 M4.5 纠正，历史记录保留在实验
+  文档的勘误中。
 - **M4（异步 admission worker）已完成**：deferred launch 移到专门 worker
-  线程 + 显式 communication stream。producer 的 `submit` 只校验 + park +
+  线程 + 显式 gate stream。producer 的 `submit` 只校验 + park +
   唤醒、立即返回；worker 线程按 plan 顺序 drain 发射，`out_of_order_submit`
   经 worker 仍强制计划顺序，`delayed_ready` 的 stream dependency 经 comm
   stream 正确，16 intent 场景 producer 继续执行与 collective 重叠。关口实验
   同时记录了硬限制：同一 communicator 多线程并发提交不安全（会打挂进程）。
-  `get_future()` 落地。详见
+  详见
   [docs/experiments/m0-m4.md](docs/experiments/m0-m4.md)。
+- **M4.5（scheduler/Work 语义重构）已完成**：scheduler
+  收敛为单 worker、rank-wide plan 投影和全局 outstanding；execution plane
+  按 process group 使用独立 gate stream；`ScheduledWork.wait()` 只透传底层
+  stream dependency，physical completion 由独立 probe 推进。原 3090 容器下线后，
+  经批准使用 2× RTX 3080 Ti 完成 GPU/NCCL capability gate；实施设计见
+  [docs/m4.5-refactor-plan.md](docs/m4.5-refactor-plan.md)，实验记录见
+  [docs/experiments/m4.5-gpu3080.md](docs/experiments/m4.5-gpu3080.md)。
 - **待开发**：Megatron DP adapter 与 plan 版本切换，
   详见 [docs/phase1-plan.md](docs/phase1-plan.md)。

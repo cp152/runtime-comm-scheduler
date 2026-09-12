@@ -22,7 +22,13 @@ import sys
 import torch
 import torch.distributed as dist
 
-from runtime_comm_scheduler import AdmissionScheduler, CommIntent, Plan, TaskKey
+from runtime_comm_scheduler import (
+    AdmissionScheduler,
+    CommIntent,
+    DirectLaunchExecutor,
+    Plan,
+    TaskKey,
+)
 from runtime_comm_scheduler.validate import ValidationError
 
 # collective 使用的 tensor 大小（float32 元素数）
@@ -76,14 +82,19 @@ def _make_all_gather(key: TaskKey, rank: int, world: int):
 
     intent = CommIntent(
         key=key, op="all_gather", tensor=tensor, process_group=None,
-        num_bytes=_N * 4, launch_fn=launch,
+        num_bytes=_N * 4, launch_fn=launch, keepalive=tuple(gathered),
     )
     return intent, verify
 
 
 def run(rank: int, world: int, scenario: str) -> dict:
     dist.init_process_group(backend="gloo")
-    sched = AdmissionScheduler(_build_plan(scenario))
+    plan = _build_plan(scenario)
+    sched = AdmissionScheduler(
+        plan,
+        local_group_ids=plan.group_ids(),
+        executor=DirectLaunchExecutor(),
+    )
     out: dict = {"rank": rank, "scenario": scenario, "status": "ok"}
     try:
         if scenario == "fifo":
@@ -134,14 +145,16 @@ def run(rank: int, world: int, scenario: str) -> dict:
         else:
             raise ValueError(f"unknown scenario: {scenario!r}")
 
+        if scenario != "op_mismatch":
+            sched.finish_window(timeout=10)
         out["launched_seq"] = {
             g: [k.as_list() for k in keys]
-            for g, keys in sched.sequence_log().items()
+            for g, keys in sched.group_sequence_log().items()
         }
         out["timings"] = [
             {
                 "key": t.key.as_list(),
-                "ready_us": t.ready_ts,
+                "ready_us": t.ready_record_ts,
                 "admit_us": t.admit_ts,
                 "submit_us": t.submit_ts,
                 "complete_us": t.complete_ts,
@@ -153,7 +166,10 @@ def run(rank: int, world: int, scenario: str) -> dict:
         out["status"] = "error"
         out["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        dist.destroy_process_group()
+        try:
+            sched.close()
+        finally:
+            dist.destroy_process_group()
     return out
 
 

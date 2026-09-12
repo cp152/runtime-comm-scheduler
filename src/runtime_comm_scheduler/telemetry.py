@@ -21,9 +21,14 @@ def now_us() -> int:
 @dataclass
 class CommTiming:
     key: TaskKey
-    ready_ts: Optional[int] = None
+    intent_ts: Optional[int] = None
+    ready_record_ts: Optional[int] = None
     admit_ts: Optional[int] = None
+    launch_start_ts: Optional[int] = None
     submit_ts: Optional[int] = None
+    first_wait_ts: Optional[int] = None
     complete_ts: Optional[int] = None
+    error_ts: Optional[int] = None
+    error_stage: Optional[str] = None
     predicted_duration_us: Optional[float] = None
     actual_duration_us: Optional[float] = None
