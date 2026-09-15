@@ -92,7 +92,8 @@ CommIntent
 - `src/runtime_comm_scheduler/`：机制接口和后续实现。
 - `src/runtime_comm_scheduler/adapters/`：框架语义适配器，首先适配 Megatron。
 - `tests/`：单元测试以及 Gloo/NCCL distributed harness。
-- `examples/`：最小可运行示例。
+- `examples/`：最小可运行示例和 replay runner。
+- `examples/workloads/`：可版本控制的静态 workload 定义；运行输出放在 `artifacts/`。
 - `configs/`：预留给后续实验配置。
 
 ## 当前状态
@@ -123,5 +124,12 @@ CommIntent
   经批准使用 2× RTX 3080 Ti 完成 GPU/NCCL capability gate；实施设计见
   [docs/m4.5-refactor-plan.md](docs/m4.5-refactor-plan.md)，实验记录见
   [docs/experiments/m4.5-gpu3080.md](docs/experiments/m4.5-gpu3080.md)。
+- **Phase 1 multi-job replay baseline 已完成静态实现**：
+  [`examples/workloads/multi_job_phase1.json`](examples/workloads/multi_job_phase1.json)
+  描述线性 compute/collective job，
+  [`examples/run_multi_job_phase1.py`](examples/run_multi_job_phase1.py)
+  启动不经过 scheduler 的多线程 raw collective replay，并输出 job/task trace；
+  设计与边界见
+  [`docs/experiments/multi-job-phase1.md`](docs/experiments/multi-job-phase1.md)。
 - **待开发**：Megatron DP adapter 与 plan 版本切换，
   详见 [docs/phase1-plan.md](docs/phase1-plan.md)。

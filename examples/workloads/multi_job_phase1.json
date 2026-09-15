@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "workload_id": "phase1-two-job-linear-v1",
+  "world_size": 2,
+  "jobs": [
+    {
+      "job_id": "job-a",
+      "process_group_id": "job-a-dp",
+      "ranks": [0, 1],
+      "tasks": [
+        {"task_id": "a-compute-0", "kind": "compute", "duration_ms": 2.0},
+        {
+          "task_id": "a-comm-0",
+          "kind": "collective",
+          "op": "all_reduce",
+          "num_bytes": 16777216
+        },
+        {"task_id": "a-compute-1", "kind": "compute", "duration_ms": 1.0},
+        {
+          "task_id": "a-comm-1",
+          "kind": "collective",
+          "op": "all_reduce",
+          "num_bytes": 16777216
+        }
+      ]
+    },
+    {
+      "job_id": "job-b",
+      "process_group_id": "job-b-dp",
+      "ranks": [0, 1],
+      "tasks": [
+        {"task_id": "b-compute-0", "kind": "compute", "duration_ms": 3.0},
+        {
+          "task_id": "b-comm-0",
+          "kind": "collective",
+          "op": "all_reduce",
+          "num_bytes": 16777216
+        },
+        {"task_id": "b-compute-1", "kind": "compute", "duration_ms": 1.0},
+        {
+          "task_id": "b-comm-1",
+          "kind": "collective",
+          "op": "all_reduce",
+          "num_bytes": 16777216
+        }
+      ]
+    }
+  ]
+}

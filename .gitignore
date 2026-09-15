@@ -1,4 +1,5 @@
 __pycache__/
+artifacts/
 *.py[cod]
 .pytest_cache/
 .venv/
@@ -10,3 +11,4 @@ logs/
 artifacts/
 *.tmp
 tmp/
+260914/
