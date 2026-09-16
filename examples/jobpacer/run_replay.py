@@ -171,7 +171,55 @@ def _validate_results(
     }
 
 
-def main() -> int:
+def _summarize_performance(
+    results: list[dict[str, Any]], args: argparse.Namespace
+) -> dict[str, Any]:
+    """Aggregate per-rank durations without comparing absolute rank clocks."""
+    workload = load_workload(args.workload)
+    jobs = []
+    for job in workload.jobs:
+        records_by_rank: dict[int, dict[str, Any]] = {}
+        for result in results:
+            rank = int(result["rank"])
+            for job_result in result.get("jobs", []):
+                if job_result["job_id"] != job.job_id:
+                    continue
+                if rank in records_by_rank:
+                    raise ValueError(
+                        f"job {job.job_id!r} has duplicate rank record for rank {rank}"
+                    )
+                records_by_rank[rank] = job_result
+        expected_ranks = ranks_for_job(job, args.world_size)
+        if set(records_by_rank) != set(expected_ranks):
+            raise ValueError(
+                f"job {job.job_id!r} expected rank records {expected_ranks}, "
+                f"got {tuple(sorted(records_by_rank))}"
+            )
+        rank_makespans_us = [
+            records_by_rank[rank]["makespan_us"] for rank in expected_ranks
+        ]
+        jobs.append(
+            {
+                "job_id": job.job_id,
+                "participating_ranks": list(expected_ranks),
+                "makespan_us": max(rank_makespans_us),
+                "rank_makespans_us": rank_makespans_us,
+                "tasks_per_rank": len(job.communications),
+            }
+        )
+    return {
+        "job_makespans": jobs,
+        "workload_makespan_us": max(
+            result["replay_makespan_us"] for result in results
+        ),
+        "rank_replay_makespans_us": [
+            result["replay_makespan_us"]
+            for result in sorted(results, key=lambda item: item["rank"])
+        ],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("bare", "scheduler"), default="scheduler")
     parser.add_argument("--policy", choices=policy_names(), default="fifo")
@@ -184,7 +232,7 @@ def main() -> int:
     parser.add_argument(
         "--fault", choices=("none", "missing_key", "metadata_mismatch"), default="none"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.world_size < 2:
         parser.error("--world-size must be at least 2")
     port = _free_port()
@@ -208,6 +256,7 @@ def main() -> int:
         return 1
     results.sort(key=lambda result: result["rank"])
     validation = _validate_results(results, args)
+    performance = _summarize_performance(results, args)
     payload = {
         "config": {
             "mode": args.mode,
@@ -220,9 +269,11 @@ def main() -> int:
             "torch": __import__("torch").__version__,
         },
         "validation": validation,
+        "performance": performance,
         "ranks": results,
     }
     if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(json.dumps(validation, indent=2, sort_keys=True))
     return 0 if validation["status"] == "ok" else 1

@@ -85,7 +85,13 @@ def _run_job(
     stop_event: threading.Event,
     fault: str,
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {"job_id": job.job_id, "status": "ok", "tasks": []}
+    job_start_ts = _now_us()
+    result: dict[str, Any] = {
+        "job_id": job.job_id,
+        "status": "ok",
+        "start_ts": job_start_ts,
+        "tasks": [],
+    }
     try:
         for spec in job.communications:
             if stop_event.is_set():
@@ -114,6 +120,7 @@ def _run_job(
             def launch(tensor=tensor, group=group):
                 return dist.all_reduce(tensor, group=group, async_op=True)
 
+            submit_call_ts = _now_us()
             if mode == "scheduler":
                 op = (
                     "all_gather"
@@ -138,24 +145,27 @@ def _run_job(
                     keepalive=(tensor,),
                 )
                 work = scheduler.submit(intent)
+                submit_return_ts = _now_us()
                 timing = work.timing
                 submit_ts = None
             else:
                 submit_ts = _now_us()
                 underlying = launch()
+                submit_return_ts = _now_us()
                 timing = None
                 work = underlying
-            compute_end = _now_us()
             consumer_start = _now_us()
             _sleep(spec.consumer_compute_s)
+            consumer_compute_end = _now_us()
             first_wait_ts = _now_us()
             if not work.wait():
                 raise RuntimeError(
                     f"collective wait returned false for {task.key.as_list()}"
                 )
-            complete_ts = _now_us()
+            wait_return_ts = _now_us()
             expected = _expected_sum(ranks_for_job(job, dist.get_world_size()))
             correct = bool(torch.all(tensor == expected).item())
+            consumer_end_ts = _now_us()
             if not correct:
                 raise AssertionError(
                     f"incorrect all_reduce result for {task.key.as_list()}"
@@ -168,13 +178,17 @@ def _run_job(
                 "correct": correct,
                 "producer_compute_start_ts": compute_start,
                 "ready_record_ts": ready_ts,
-                "producer_compute_end_ts": compute_end,
+                "producer_compute_end_ts": ready_ts,
+                "submit_call_ts": submit_call_ts,
+                "submit_return_ts": submit_return_ts,
                 "consumer_compute_start_ts": consumer_start,
+                "consumer_compute_end_ts": consumer_compute_end,
                 "first_wait_ts": timing.first_wait_ts if timing else first_wait_ts,
-                "consumer_end_ts": complete_ts,
+                "wait_return_ts": wait_return_ts,
+                "consumer_end_ts": consumer_end_ts,
                 "submit_ts": timing.submit_ts if timing else submit_ts,
                 "admit_ts": timing.admit_ts if timing else submit_ts,
-                "complete_ts": timing.complete_ts if timing else complete_ts,
+                "complete_ts": timing.complete_ts if timing else consumer_end_ts,
                 "mode": mode,
             }
             result["tasks"].append(task_result)
@@ -183,6 +197,10 @@ def _run_job(
         result["error"] = f"{type(exc).__name__}: {exc}"
         errors.append(exc)
         stop_event.set()
+    finally:
+        job_end_ts = _now_us()
+        result["end_ts"] = job_end_ts
+        result["makespan_us"] = job_end_ts - job_start_ts
     return result
 
 
@@ -245,6 +263,7 @@ def run_rank(args: argparse.Namespace) -> dict[str, Any]:
                 fault=args.fault,
             )
 
+        replay_start_ts = _now_us()
         for job in local_jobs:
             thread = threading.Thread(
                 target=run_one, args=(job,), name=f"replay-{job.job_id}"
@@ -253,6 +272,7 @@ def run_rank(args: argparse.Namespace) -> dict[str, Any]:
             thread.start()
         for thread in threads:
             thread.join(timeout=args.thread_timeout)
+        replay_end_ts = _now_us()
         if any(thread.is_alive() for thread in threads):
             raise TimeoutError(
                 f"job thread did not finish within {args.thread_timeout}s"
@@ -282,6 +302,9 @@ def run_rank(args: argparse.Namespace) -> dict[str, Any]:
             "max_outstanding": (
                 args.max_outstanding if args.mode == "scheduler" else None
             ),
+            "replay_start_ts": replay_start_ts,
+            "replay_end_ts": replay_end_ts,
+            "replay_makespan_us": replay_end_ts - replay_start_ts,
             "jobs": jobs_result,
             "status": "ok",
         }
@@ -316,8 +339,24 @@ def run_rank(args: argparse.Namespace) -> dict[str, Any]:
                         }
                     )
         else:
-            trace["launch_sequence"] = []
-            trace["group_sequence"] = {}
+            bare_tasks = [
+                task
+                for job_result in jobs_result
+                for task in job_result["tasks"]
+            ]
+            ordered_bare_tasks = sorted(
+                bare_tasks,
+                key=lambda task: (task["submit_call_ts"], task["job_id"]),
+            )
+            trace["launch_sequence"] = [task["key"] for task in ordered_bare_tasks]
+            trace["group_sequence"] = {
+                job.job_id: [
+                    task["key"]
+                    for task in ordered_bare_tasks
+                    if task["job_id"] == job.job_id
+                ]
+                for job in local_jobs
+            }
             trace["timings"] = []
         completed = True
         return trace

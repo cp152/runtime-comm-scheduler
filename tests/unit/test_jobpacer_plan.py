@@ -1,6 +1,8 @@
 """Static JobPacer Plan order, dependency, and determinism checks."""
 
 import sys
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
@@ -72,3 +74,17 @@ def test_job_membership_accepts_arbitrary_global_ranks():
     assert ranks_for_job(workload.jobs[0], 4) == (3, 0, 2)
     restored = Workload.from_dict(workload.to_dict())
     assert restored.jobs[0].ranks == (3, 0, 2)
+
+
+def test_workload_manifest_round_trip_preserves_phase1_compute_windows():
+    workload = _workload()
+    restored = Workload.from_dict(workload.to_dict())
+    assert restored == workload
+    communication = restored.jobs[0].communications[0]
+    assert communication.producer_compute_s == 0.0
+    assert communication.consumer_compute_s == 0.01
+
+
+def test_job_rejects_nonconsecutive_communication_ids():
+    with pytest.raises(ValueError, match="ordinals must be consecutive"):
+        Job("bad", (CollectiveComm(1),))
